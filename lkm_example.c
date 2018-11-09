@@ -21,7 +21,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Aleksandr Fursov");
 MODULE_DESCRIPTION("A simple Linux module.");
 MODULE_VERSION("0.01");
-//objdump посмотреть про бинарник
 
 
 
