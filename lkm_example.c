@@ -17,10 +17,19 @@ static void __exit lkm_example_exit(void) {
 module_init(lkm_example_init);
 module_exit(lkm_example_exit);
 
+void foo(void) {
+	printk(KERN_INFO "foo\n");
+}
+
+void fee(void) {
+	printk(KERN_INFO "fee\n");
+}
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Aleksandr Fursov");
 MODULE_DESCRIPTION("A simple Linux module.");
 MODULE_VERSION("0.01");
+//objdump -d lkm_example.o
 
 
 
