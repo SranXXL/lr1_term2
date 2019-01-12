@@ -13,8 +13,10 @@
 #define DEVICE_NAME "lr2_term2"
 #define READER 32768
 #define WRITER 32769
+#define BUF_LEN_MIN 5
+#define BUF_LEN_MAX 1000
 
-static int buf_len = 10;
+static int buf_len = BUF_LEN_MAX;
 module_param(buf_len, int , 0);
 
 static int major_num;
@@ -55,68 +57,55 @@ static struct file_operations file_ops = {
 	.release = device_release
 };
 
-struct aval_space {
-	int from_cur;
-	int from_start;
-};
-
-static struct aval_space calc_space(struct context *user, char *ptr) {
+static int space_calc(struct context *user, char *ptr) {
 	char *ptr_inverse;
-	struct aval_space result;
-	bool flag = false;
+	int result = 0;
 
 	if (ptr == user->write_ptr) {
 		ptr_inverse = user->read_ptr;
 	} else {
 		ptr_inverse = user->write_ptr;
 	}
-	while (ptr != ptr_inverse) {
-		if (flag) {
-			result.from_start++;
-		} else {
-			result.from_cur++;
-		}
+	while (ptr != user->msg_buffer + user->buf_len) {
+		++result;
 		++ptr;
-		if (ptr == user->msg_buffer + user->buf_len) {
-			ptr = user->msg_buffer;
-			flag = true;
+		if (ptr == ptr_inverse) {
+			break;
 		}
-	}
-	if (user->empty || user->full) {
-		result.from_cur = user->buf_len;
-		result.from_start = 0;
 	}
 	return result;
 }
 
 static ssize_t device_read(struct file *file, char __user *buffer, size_t len, loff_t *offset) {
 	struct context *user = (struct context *)file->private_data;
-	struct aval_space space;
+	int space;
 	int bytes_read = 0;
 
-	printk(KERN_INFO "IN READ!\n");
+	//printk(KERN_INFO "IN READ!\n");
 	mutex_lock_interruptible(user->lock);
 	while (len) {		
 		if (user->empty) {
 			mutex_unlock(user->lock);
-			printk(KERN_INFO "SLEEP IN READ, MUTEX: %d!\n", mutex_is_locked(user->lock));
+			wake_up_interruptible(&wq);	
+			//printk(KERN_INFO "SLEEP IN READ, MUTEX: %d!\n", mutex_is_locked(user->lock));
 			wait_event_interruptible(wq, user->empty == false);
 			mutex_lock_interruptible(user->lock);
 		}
-		space = calc_space(user, user->read_ptr);
-		if (copy_to_user(buffer + bytes_read, user->read_ptr, space.from_cur)) {
+		space = space_calc(user, user->read_ptr);
+		if (len < space) {
+			if (copy_to_user(buffer + bytes_read, user->read_ptr, len)) {
+				goto errCopy;
+			}
+			bytes_read += len;
+			user->read_ptr += len;
+			user->full = false;
+			break;
+		}
+		if (copy_to_user(buffer + bytes_read, user->read_ptr, space)) {
 			goto errCopy;
 		}
-		bytes_read += space.from_cur;
-		if (copy_to_user(buffer + bytes_read, user->msg_buffer, space.from_start)) {
-			goto errCopy;
-		}
-		bytes_read += space.from_start;
-		if (space.from_start) {
-			user->read_ptr = user->msg_buffer + space.from_start;
-		} else {
-			user->read_ptr += space.from_cur;
-		}
+		bytes_read += space;
+		user->read_ptr += space;
 		if (user->read_ptr == user->msg_buffer + user->buf_len) {
 			user->read_ptr = user->msg_buffer;
 		}
@@ -124,9 +113,9 @@ static ssize_t device_read(struct file *file, char __user *buffer, size_t len, l
 			user->empty = true;
 		}
 		user->full = false;
-		len -= space.from_cur + space.from_start;
-		wake_up_interruptible(&wq);		
+		len -= space;	
 	}
+	wake_up_interruptible(&wq);
 	mutex_unlock(user->lock);
 	return bytes_read;
 errCopy:
@@ -138,33 +127,34 @@ errCopy:
 
 static ssize_t device_write(struct file *file, const char __user *buffer, size_t len, loff_t *offset) {
 	struct context *user = (struct context *)file->private_data;
-	struct aval_space space;
+	int space;
 	int bytes_write = 0;
 
-	printk(KERN_INFO "IN WRITE!\n");
+	//printk(KERN_INFO "IN WRITE!\n");
 	mutex_lock_interruptible(user->lock);
 	while (len) {		
 		if (user->full) {
 			mutex_unlock(user->lock);
-			printk(KERN_INFO "SLEEP IN WRITE, MUTEX: %d!\n", mutex_is_locked(user->lock));
+			wake_up_interruptible(&wq);
+			//printk(KERN_INFO "SLEEP IN WRITE, MUTEX: %d!\n", mutex_is_locked(user->lock));
 			wait_event_interruptible(wq, user->full == false);
 			mutex_lock_interruptible(user->lock);
 		}
-		space = calc_space(user, user->write_ptr);
-		//printk(KERN_INFO "SPACE do konca: %d\tot nachala: %d\n", space.from_cur, space.from_start);
-		if (copy_from_user(user->write_ptr, buffer + bytes_write, space.from_cur)) {
+		space = space_calc(user, user->write_ptr);
+		if (len < space) {
+			if (copy_from_user(user->write_ptr, buffer + bytes_write, len)) {
+				goto errCopy;
+			}
+			bytes_write += len;
+			user->write_ptr += len;
+			user->empty = false;
+			break;
+		}
+		if (copy_from_user(user->write_ptr, buffer + bytes_write, space)) {
 			goto errCopy;
 		}
-		bytes_write += space.from_cur;
-		if (copy_from_user(user->msg_buffer, buffer + bytes_write, space.from_start)) {
-			goto errCopy;
-		}
-		bytes_write += space.from_start;
-		if (space.from_start) {
-			user->write_ptr = user->msg_buffer + space.from_start;
-		} else {
-			user->write_ptr += space.from_cur;
-		}
+		bytes_write += space;
+		user->write_ptr += space;
 		if (user->write_ptr == user->msg_buffer + user->buf_len) {
 			user->write_ptr = user->msg_buffer;
 		}
@@ -172,9 +162,9 @@ static ssize_t device_write(struct file *file, const char __user *buffer, size_t
 			user->full = true;
 		}
 		user->empty = false;
-		len -= space.from_cur + space.from_start;
-		wake_up_interruptible(&wq);		
+		len -= space;		
 	}
+	wake_up_interruptible(&wq);
 	mutex_unlock(user->lock);
 	return bytes_write;
 errCopy:
@@ -186,17 +176,11 @@ errCopy:
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 	struct context *user = (struct context *)file->private_data;
 	char *new_msg_buf;
-	struct aval_space space;
+	int space;
 
 	mutex_lock_interruptible(user->lock);
-	// Размер буфера не изменяется
-	if (arg == user->buf_len) {
-		printk(KERN_ALERT "new buffer size is %d\n", buf_len);
-		mutex_unlock(user->lock);
-		return 0;
-	}
 	// Проверка допустимого значения размера буфера
-	if ((arg < 1) || (arg > 100) || (arg < buf_len)) {
+	if ((arg < BUF_LEN_MIN) || (arg > BUF_LEN_MAX) || (arg <= user->buf_len)) {
 		printk(KERN_ERR "Error! The size hasn`t been changed!\n");
 		printk(KERN_ERR "Invalid size of buffer: %ld\n", arg);
 		mutex_unlock(user->lock);
@@ -211,15 +195,19 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	}
 	if (user->empty) {
 		user->write_ptr = new_msg_buf;
+		user->read_ptr = new_msg_buf;
 	} else {
-		space = calc_space(user, user->read_ptr);
-		strncpy(new_msg_buf, user->read_ptr, space.from_start + space.from_cur);
-		user->write_ptr = new_msg_buf + space.from_start + space.from_cur;
+		strncpy(new_msg_buf, user->msg_buffer, user->buf_len);
+		space = user->write_ptr - user->msg_buffer;
+		user->write_ptr = new_msg_buf + space;
+		space = user->read_ptr - user->msg_buffer;
+		user->read_ptr = new_msg_buf + space;
 	}
 	user->msg_buffer = new_msg_buf;
-	user->read_ptr = new_msg_buf;
 	user->buf_len = arg;
+	user->full = false;
 	mutex_unlock(user->lock);
+	printk(KERN_ALERT "new buffer size is %d\n", user->buf_len);
 	return 0;
 }
 
@@ -324,7 +312,7 @@ static int device_release(struct inode *inode, struct file *file) {
 
 static int __init lr2_term2_init(void) {
 	// Проверка допустимого значения размера буфера
-	if ((buf_len < 1) || (buf_len > 100)) {
+	if ((buf_len < BUF_LEN_MIN) || (buf_len > BUF_LEN_MAX)) {
 		printk(KERN_INFO "Error! Invalid size of buffer: %d\n", buf_len);
 		return -1;	
 	}
@@ -357,23 +345,6 @@ module_init(lr2_term2_init);
 module_exit(lr2_term2_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Fursov Aleksandr");
+MODULE_AUTHOR("Druzhinina Fursov");
 MODULE_DESCRIPTION("Lr2_term2");
 MODULE_VERSION("0.01");
-
-/*
-	kfree(msg_buffer);
-	buf_len = arg;
-	msg_buffer = (char *)kcalloc(buf_len, sizeof(char), GFP_KERNEL);
-	if (msg_buffer == NULL) {
-		printk(KERN_ERR "Error! Unable to allocate memory!\n");
-		return -1;
-	}
-		msg_buffer[buf_len] = '\0';
-	
-		read_ptr = msg_buffer;
-	write_ptr = msg_buffer;
-	empty = true;
-	full = false;
-	printk(KERN_INFO "Size of buffer has been changed: %d\n", buf_len);
-*/
